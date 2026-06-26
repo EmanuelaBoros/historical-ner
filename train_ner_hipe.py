@@ -317,8 +317,6 @@ class HipeTokenDataset(Dataset):
         self.tokenizer = tokenizer
         self.label2id = label2id
 
-        # BERT cannot go beyond 512 positions.
-        # Keep this hard cap even if the CLI gives a larger value.
         tokenizer_max = getattr(tokenizer, "model_max_length", 512)
         if tokenizer_max is None or tokenizer_max > 100000:
             tokenizer_max = 512
@@ -371,8 +369,7 @@ class HipeTokenDataset(Dataset):
         encoded["labels"] = aligned_labels
         encoded["time_values"] = time_values
 
-        # Absolute safety truncation for every field.
-        # This prevents any sequence >512 from reaching BERT.
+        # Absolute safety truncation.
         for key in list(encoded.keys()):
             if isinstance(encoded[key], list):
                 encoded[key] = encoded[key][: self.max_length]
@@ -381,6 +378,7 @@ class HipeTokenDataset(Dataset):
         encoded["time_values"] = encoded["time_values"][: self.max_length]
 
         return encoded
+
 
 # -------------------------
 # Custom collator
@@ -423,8 +421,43 @@ class DataCollatorForTokenClassificationWithTime:
 
 
 # -------------------------
-# Model
+# Improved model
 # -------------------------
+
+
+class GatedTransformerBlock(nn.Module):
+    """
+    Extra Transformer block with gated residual connection.
+
+    This is safer than directly stacking random Transformer layers on top of BERT.
+    The model starts close to the BERT baseline and learns how much to use the new layer.
+    """
+
+    def __init__(self, hidden_size, num_heads, intermediate_size, dropout=0.1):
+        super().__init__()
+
+        self.layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=intermediate_size,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+
+        # Small initial gate. Extra layer starts with limited influence.
+        self.gate = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, hidden_states, key_padding_mask=None):
+        transformed = self.layer(
+            hidden_states,
+            src_key_padding_mask=key_padding_mask,
+        )
+
+        gate = torch.tanh(self.gate)
+
+        return hidden_states + gate * (transformed - hidden_states)
 
 
 class HistoricalBertNER(PreTrainedModel):
@@ -435,10 +468,11 @@ class HistoricalBertNER(PreTrainedModel):
         historical BERT -> classifier
 
     stacked:
-        historical BERT -> 2 TransformerEncoder layers -> classifier
+        historical BERT -> gated extra Transformer layers -> classifier
 
     time:
-        historical BERT + date/time embedding -> 2 TransformerEncoder layers -> classifier
+        historical BERT -> gated temporal FiLM encoding
+        -> gated extra Transformer layers -> classifier
     """
 
     config_class = AutoConfig
@@ -466,25 +500,32 @@ class HistoricalBertNER(PreTrainedModel):
         self.dropout = nn.Dropout(dropout)
 
         if self.use_time:
+            # FiLM-style temporal conditioning:
+            # hidden = hidden + gate * (gamma * hidden + beta)
             self.time_mlp = nn.Sequential(
                 nn.Linear(1, hidden_size),
                 nn.Tanh(),
-                nn.Linear(hidden_size, hidden_size),
+                nn.Linear(hidden_size, 2 * hidden_size),
             )
+
+            # Start time influence very small.
+            self.time_gate = nn.Parameter(torch.tensor(0.05))
+
+            # Start close to the stacked model.
+            nn.init.zeros_(self.time_mlp[-1].weight)
+            nn.init.zeros_(self.time_mlp[-1].bias)
 
         if self.extra_layers > 0:
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=config.num_attention_heads,
-                dim_feedforward=config.intermediate_size,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=True,
-            )
-
-            self.extra_encoder = nn.TransformerEncoder(
-                encoder_layer,
-                num_layers=self.extra_layers,
+            self.extra_encoder = nn.ModuleList(
+                [
+                    GatedTransformerBlock(
+                        hidden_size=hidden_size,
+                        num_heads=config.num_attention_heads,
+                        intermediate_size=config.intermediate_size,
+                        dropout=dropout,
+                    )
+                    for _ in range(self.extra_layers)
+                ]
             )
 
         self.classifier = nn.Linear(hidden_size, num_labels)
@@ -516,16 +557,23 @@ class HistoricalBertNER(PreTrainedModel):
             time_values = time_values.to(sequence_output.device).float()
             time_values = time_values.unsqueeze(-1)
 
-            time_emb = self.time_mlp(time_values)
-            sequence_output = sequence_output + time_emb
+            gamma_beta = self.time_mlp(time_values)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+
+            time_gate = torch.tanh(self.time_gate)
+
+            sequence_output = sequence_output + time_gate * (
+                gamma * sequence_output + beta
+            )
 
         if self.extra_layers > 0:
             key_padding_mask = attention_mask == 0
 
-            sequence_output = self.extra_encoder(
-                sequence_output,
-                src_key_padding_mask=key_padding_mask,
-            )
+            for layer in self.extra_encoder:
+                sequence_output = layer(
+                    sequence_output,
+                    key_padding_mask=key_padding_mask,
+                )
 
         sequence_output = self.dropout(sequence_output)
 
@@ -614,6 +662,56 @@ def get_predictions_and_report(trainer, dataset, label_list):
 
 
 # -------------------------
+# Optimizer
+# -------------------------
+
+
+def build_optimizer(model, args):
+    """
+    Use a smaller LR for pretrained BERT and a larger LR for newly initialized layers.
+    This helps stacked/time models learn without damaging the historical BERT encoder.
+    """
+
+    bert_params = []
+    new_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if name.startswith("bert."):
+            bert_params.append(param)
+        else:
+            new_params.append(param)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": bert_params,
+                "lr": args.bert_learning_rate,
+                "weight_decay": args.weight_decay,
+            },
+            {
+                "params": new_params,
+                "lr": args.head_learning_rate,
+                "weight_decay": args.weight_decay,
+            },
+        ],
+        eps=1e-8,
+    )
+
+    print("=" * 80)
+    print("OPTIMIZER PARAMETER GROUPS")
+    print("=" * 80)
+    print(f"BERT parameters: {sum(p.numel() for p in bert_params):,}")
+    print(f"New/head parameters: {sum(p.numel() for p in new_params):,}")
+    print(f"BERT LR: {args.bert_learning_rate}")
+    print(f"Head/new LR: {args.head_learning_rate}")
+
+    return optimizer
+
+
+# -------------------------
 # Training
 # -------------------------
 
@@ -668,7 +766,7 @@ def train_one_variant(args, variant: str):
         model_name=args.model_name,
         num_labels=len(label_list),
         variant=variant,
-        extra_layers=2,
+        extra_layers=args.extra_layers,
         dropout=args.dropout,
     )
 
@@ -679,6 +777,7 @@ def train_one_variant(args, variant: str):
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.epochs,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
@@ -690,11 +789,15 @@ def train_one_variant(args, variant: str):
         greater_is_better=True,
         report_to="none",
         fp16=args.fp16,
+        bf16=args.bf16,
         save_total_limit=2,
         seed=args.seed,
+        max_grad_norm=args.max_grad_norm,
     )
 
     data_collator = DataCollatorForTokenClassificationWithTime(tokenizer)
+
+    optimizer = build_optimizer(model, args)
 
     trainer = Trainer(
         model=model,
@@ -703,6 +806,7 @@ def train_one_variant(args, variant: str):
         eval_dataset=test_dataset,
         data_collator=data_collator,
         compute_metrics=make_compute_metrics(label_list),
+        optimizers=(optimizer, None),
     )
 
     trainer.train()
@@ -737,6 +841,14 @@ def train_one_variant(args, variant: str):
                 "metrics": metrics,
                 "classification_report": report,
                 "labels": label_list,
+                "model_name": args.model_name,
+                "max_length": args.max_length,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "bert_learning_rate": args.bert_learning_rate,
+                "head_learning_rate": args.head_learning_rate,
+                "dropout": args.dropout,
+                "extra_layers": args.extra_layers,
             },
             f,
             indent=2,
@@ -773,17 +885,28 @@ def main():
     )
 
     parser.add_argument("--output_dir", type=str, default="outputs/ner_hipe")
-    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--max_length", type=int, default=512)
 
     parser.add_argument("--epochs", type=float, default=5)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+
+    # Kept for TrainingArguments compatibility.
     parser.add_argument("--learning_rate", type=float, default=3e-5)
+
+    # Actually used by our custom optimizer.
+    parser.add_argument("--bert_learning_rate", type=float, default=2e-5)
+    parser.add_argument("--head_learning_rate", type=float, default=8e-5)
+
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.15)
+    parser.add_argument("--extra_layers", type=int, default=2)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--bf16", action="store_true")
 
     args = parser.parse_args()
 
