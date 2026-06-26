@@ -480,7 +480,7 @@ def train_one_variant(args, variant: str):
         num_train_epochs=args.epochs,
         weight_decay=args.weight_decay,
         warmup_ratio=args.warmup_ratio,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         logging_steps=50,
         load_best_model_at_end=True,
