@@ -96,6 +96,13 @@ all
 
 ## Results
 
+| Model | Overall P | Overall R | Overall F1 | Loss | loc F1 | org F1 | pers F1 | prod F1 | time F1 | Macro F1 | Weighted F1 | Epochs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `baseline` | 0.7879 | 0.7422 | 0.7644 | 0.1448 | 0.86 | 0.60 | 0.69 | 0.71 | 0.37 | 0.65 | 0.76 | 5 |
+| `stacked` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 5 |
+| `time` | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 5 |
+
+
 | Model | Entity type | Precision | Recall | F1 | Loss | Support | Epochs |
 |---|---|---:|---:|---:|---:|---:|---:|
 | `baseline` | **overall / micro avg** | 0.7879 | 0.7422 | 0.7644 | 0.1448 | 1567 | 5 |
@@ -108,6 +115,5 @@ all
 | `baseline` | **weighted avg** | 0.78 | 0.74 | 0.76 | 0.1448 | 1567 | 5 |
 | `stacked` | **overall / micro avg** | TBD | TBD | TBD | TBD | TBD | 5 |
 | `time` | **overall / micro avg** | TBD | TBD | TBD | TBD | TBD | 5 |
-
 
 The combined results are saved to: `outputs/ner_hipe/all_results.json`.
