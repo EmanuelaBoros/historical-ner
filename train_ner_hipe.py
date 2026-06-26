@@ -316,7 +316,16 @@ class HipeTokenDataset(Dataset):
         self.examples = examples
         self.tokenizer = tokenizer
         self.label2id = label2id
-        self.max_length = max_length
+
+        # BERT cannot go beyond 512 positions.
+        # Keep this hard cap even if the CLI gives a larger value.
+        tokenizer_max = getattr(tokenizer, "model_max_length", 512)
+        if tokenizer_max is None or tokenizer_max > 100000:
+            tokenizer_max = 512
+
+        self.max_length = min(max_length, tokenizer_max, 512)
+
+        print(f"Using max_length={self.max_length}")
 
     def __len__(self):
         return len(self.examples)
@@ -334,6 +343,8 @@ class HipeTokenDataset(Dataset):
             is_split_into_words=True,
             truncation=True,
             max_length=self.max_length,
+            padding=False,
+            return_attention_mask=True,
         )
 
         word_ids = encoded.word_ids()
@@ -360,8 +371,16 @@ class HipeTokenDataset(Dataset):
         encoded["labels"] = aligned_labels
         encoded["time_values"] = time_values
 
-        return encoded
+        # Absolute safety truncation for every field.
+        # This prevents any sequence >512 from reaching BERT.
+        for key in list(encoded.keys()):
+            if isinstance(encoded[key], list):
+                encoded[key] = encoded[key][: self.max_length]
 
+        encoded["labels"] = encoded["labels"][: self.max_length]
+        encoded["time_values"] = encoded["time_values"][: self.max_length]
+
+        return encoded
 
 # -------------------------
 # Custom collator
