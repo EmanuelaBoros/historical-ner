@@ -6,17 +6,18 @@
 #   "evaluate",
 #   "seqeval",
 #   "scikit-learn",
-#   "accelerate"
+#   "accelerate",
+#   "safetensors"
 # ]
 # ///
 
 import os
 import re
-import math
+import json
 import argparse
 from pathlib import Path
-from dataclasses import dataclass
 from typing import List, Dict, Optional
+from collections import Counter
 
 import torch
 import torch.nn as nn
@@ -46,6 +47,65 @@ LABEL_COLUMN = "NE-COARSE-LIT"
 
 
 # -------------------------
+# Label normalization
+# -------------------------
+
+
+def normalize_ner_label(label: str) -> str:
+    """
+    Normalize mixed NER labels from different HIPE / historical NER files.
+
+    Examples:
+    B-PER       -> B-pers
+    I-ORG       -> I-org
+    B-LOC       -> B-loc
+    B-STREET    -> B-loc
+    B-BUILDING  -> B-loc
+    B-HumanProd -> B-prod
+    B-object    -> B-prod
+    B-work      -> B-prod
+    B-date      -> B-time
+    """
+
+    if label in ["O", "_", ""]:
+        return "O"
+
+    if "-" not in label:
+        return label
+
+    prefix, ent_type = label.split("-", 1)
+
+    prefix = prefix.upper()
+    ent_type_norm = ent_type.lower()
+
+    type_map = {
+        # people
+        "per": "pers",
+        "pers": "pers",
+        # locations
+        "loc": "loc",
+        "building": "loc",
+        "street": "loc",
+        # organizations
+        "org": "org",
+        # products / works / objects
+        "prod": "prod",
+        "humanprod": "prod",
+        "object": "prod",
+        "work": "prod",
+        # temporal expressions
+        "time": "time",
+        "date": "time",
+        # task-specific
+        "scope": "scope",
+    }
+
+    ent_type_norm = type_map.get(ent_type_norm, ent_type_norm)
+
+    return f"{prefix}-{ent_type_norm}"
+
+
+# -------------------------
 # TSV reading
 # -------------------------
 
@@ -53,21 +113,24 @@ LABEL_COLUMN = "NE-COARSE-LIT"
 def parse_year(date_str: Optional[str]) -> int:
     if not date_str:
         return 1800
+
     m = re.match(r"(\d{4})", date_str)
     if not m:
         return 1800
+
     return int(m.group(1))
 
 
 def normalize_year(year: int) -> float:
     """
     Rough normalization for historical documents.
-    Example:
+
     1700 -> -1
     1800 -> 0
     1900 -> 1
     2000 -> 2
     """
+
     return (year - 1800) / 100.0
 
 
@@ -88,7 +151,6 @@ def read_hipe_tsv(path: Path, label_column: str = LABEL_COLUMN) -> List[Dict]:
 
     current_tokens = []
     current_labels = []
-    current_date = None
     current_year = 1800
 
     header = None
@@ -97,6 +159,7 @@ def read_hipe_tsv(path: Path, label_column: str = LABEL_COLUMN) -> List[Dict]:
 
     def flush_sentence():
         nonlocal current_tokens, current_labels, current_year
+
         if current_tokens:
             examples.append(
                 {
@@ -106,6 +169,7 @@ def read_hipe_tsv(path: Path, label_column: str = LABEL_COLUMN) -> List[Dict]:
                     "source_file": str(path),
                 }
             )
+
         current_tokens = []
         current_labels = []
 
@@ -119,16 +183,18 @@ def read_hipe_tsv(path: Path, label_column: str = LABEL_COLUMN) -> List[Dict]:
 
             if line.startswith("#"):
                 if line.startswith("# hipe2022:date ="):
-                    current_date = line.split("=", 1)[1].strip()
-                    current_year = parse_year(current_date)
+                    date_str = line.split("=", 1)[1].strip()
+                    current_year = parse_year(date_str)
                 continue
 
             cols = line.split("\t")
 
             if header is None:
                 header = cols
+
                 if label_column not in header:
                     raise ValueError(f"{label_column} not found in header of {path}")
+
                 label_idx = header.index(label_column)
                 misc_idx = header.index("MISC") if "MISC" in header else None
                 continue
@@ -137,7 +203,8 @@ def read_hipe_tsv(path: Path, label_column: str = LABEL_COLUMN) -> List[Dict]:
                 continue
 
             token = cols[0]
-            label = cols[label_idx]
+            label = normalize_ner_label(cols[label_idx])
+
             misc = (
                 cols[misc_idx] if misc_idx is not None and len(cols) > misc_idx else "_"
             )
@@ -149,15 +216,31 @@ def read_hipe_tsv(path: Path, label_column: str = LABEL_COLUMN) -> List[Dict]:
                 flush_sentence()
 
     flush_sentence()
+
     return examples
 
 
 def load_all_data(data_dir: str, target_test_file: str = TARGET_TEST_FILE):
     data_dir = Path(data_dir)
 
+    print("CWD:", os.getcwd())
+    print("Data dir:", data_dir)
+    print("Data dir exists:", data_dir.exists())
+
     all_tsvs = sorted(data_dir.rglob("*.tsv"))
 
-    test_paths = [p for p in all_tsvs if p.name == target_test_file]
+    print(f"Found {len(all_tsvs)} TSV files:")
+    for p in all_tsvs:
+        print(" -", p)
+
+    target_test_file = str(target_test_file)
+
+    test_paths = [
+        p
+        for p in all_tsvs
+        if p.name == Path(target_test_file).name or str(p).endswith(target_test_file)
+    ]
+
     if not test_paths:
         raise FileNotFoundError(f"Could not find target test file: {target_test_file}")
 
@@ -187,20 +270,39 @@ def load_all_data(data_dir: str, target_test_file: str = TARGET_TEST_FILE):
 
 def build_label_maps(train_examples, test_examples):
     labels = set()
+
     for ex in train_examples + test_examples:
         labels.update(ex["labels"])
 
     labels = sorted(labels)
 
-    # Put O first if present
     if "O" in labels:
         labels.remove("O")
         labels = ["O"] + labels
 
-    label2id = {l: i for i, l in enumerate(labels)}
-    id2label = {i: l for l, i in label2id.items()}
+    label2id = {label: i for i, label in enumerate(labels)}
+    id2label = {i: label for label, i in label2id.items()}
 
     return labels, label2id, id2label
+
+
+def print_label_distribution(examples, title):
+    counter = Counter()
+
+    for ex in examples:
+        counter.update(ex["labels"])
+
+    print("=" * 80)
+    print(title)
+    print("=" * 80)
+
+    for label, count in counter.most_common():
+        print(f"{label}\t{count}")
+
+
+# -------------------------
+# Dataset
+# -------------------------
 
 
 class HipeTokenDataset(Dataset):
@@ -246,7 +348,6 @@ class HipeTokenDataset(Dataset):
                 aligned_labels.append(-100)
                 time_values.append(0.0)
             else:
-                # Label first subtoken, ignore remaining subtokens
                 if word_idx != previous_word_idx:
                     aligned_labels.append(self.label2id[labels[word_idx]])
                 else:
@@ -263,13 +364,53 @@ class HipeTokenDataset(Dataset):
 
 
 # -------------------------
+# Custom collator
+# -------------------------
+
+
+class DataCollatorForTokenClassificationWithTime:
+    """
+    Pads standard token-classification fields plus custom time_values.
+    """
+
+    def __init__(self, tokenizer, label_pad_token_id=-100):
+        self.tokenizer = tokenizer
+        self.base_collator = DataCollatorForTokenClassification(
+            tokenizer=tokenizer,
+            label_pad_token_id=label_pad_token_id,
+        )
+
+    def __call__(self, features):
+        time_values = [feature.pop("time_values") for feature in features]
+
+        batch = self.base_collator(features)
+
+        max_len = batch["input_ids"].shape[1]
+
+        padded_time_values = []
+
+        for values in time_values:
+            values = values[:max_len]
+            pad_len = max_len - len(values)
+            values = values + [0.0] * pad_len
+            padded_time_values.append(values)
+
+        batch["time_values"] = torch.tensor(
+            padded_time_values,
+            dtype=torch.float,
+        )
+
+        return batch
+
+
+# -------------------------
 # Model
 # -------------------------
 
 
 class HistoricalBertNER(PreTrainedModel):
     """
-    Three possible variants:
+    Variants:
 
     baseline:
         historical BERT -> classifier
@@ -321,6 +462,7 @@ class HistoricalBertNER(PreTrainedModel):
                 activation="gelu",
                 batch_first=True,
             )
+
             self.extra_encoder = nn.TransformerEncoder(
                 encoder_layer,
                 num_layers=self.extra_layers,
@@ -360,17 +502,21 @@ class HistoricalBertNER(PreTrainedModel):
 
         if self.extra_layers > 0:
             key_padding_mask = attention_mask == 0
+
             sequence_output = self.extra_encoder(
                 sequence_output,
                 src_key_padding_mask=key_padding_mask,
             )
 
         sequence_output = self.dropout(sequence_output)
+
         logits = self.classifier(sequence_output)
 
         loss = None
+
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+
             loss = loss_fn(
                 logits.view(-1, self.num_labels),
                 labels.view(-1),
@@ -402,6 +548,7 @@ def make_compute_metrics(label_list):
             for p, l in zip(pred_seq, label_seq):
                 if l == -100:
                     continue
+
                 sent_preds.append(label_list[p])
                 sent_labels.append(label_list[l])
 
@@ -415,6 +562,36 @@ def make_compute_metrics(label_list):
         }
 
     return compute_metrics
+
+
+def get_predictions_and_report(trainer, dataset, label_list):
+    predictions_output = trainer.predict(dataset)
+
+    logits = predictions_output.predictions
+    labels = predictions_output.label_ids
+
+    predictions = logits.argmax(axis=-1)
+
+    true_predictions = []
+    true_labels = []
+
+    for pred_seq, label_seq in zip(predictions, labels):
+        sent_preds = []
+        sent_labels = []
+
+        for p, l in zip(pred_seq, label_seq):
+            if l == -100:
+                continue
+
+            sent_preds.append(label_list[p])
+            sent_labels.append(label_list[l])
+
+        true_predictions.append(sent_preds)
+        true_labels.append(sent_labels)
+
+    report = classification_report(true_labels, true_predictions)
+
+    return report
 
 
 # -------------------------
@@ -432,9 +609,15 @@ def train_one_variant(args, variant: str):
         target_test_file=args.test_file,
     )
 
+    print_label_distribution(train_examples, "TRAIN LABEL DISTRIBUTION")
+    print_label_distribution(test_examples, "TEST LABEL DISTRIBUTION")
+
     label_list, label2id, id2label = build_label_maps(train_examples, test_examples)
 
-    print("Labels:")
+    print("=" * 80)
+    print("NORMALIZED LABELS")
+    print("=" * 80)
+
     for label in label_list:
         print(label)
 
@@ -492,7 +675,7 @@ def train_one_variant(args, variant: str):
         seed=args.seed,
     )
 
-    data_collator = DataCollatorForTokenClassification(tokenizer)
+    data_collator = DataCollatorForTokenClassificationWithTime(tokenizer)
 
     trainer = Trainer(
         model=model,
@@ -506,13 +689,49 @@ def train_one_variant(args, variant: str):
     trainer.train()
 
     metrics = trainer.evaluate()
-    print(f"Final test metrics for {variant}:")
+
+    print("=" * 80)
+    print(f"FINAL TEST METRICS FOR {variant}")
+    print("=" * 80)
     print(metrics)
+
+    report = get_predictions_and_report(
+        trainer=trainer,
+        dataset=test_dataset,
+        label_list=label_list,
+    )
+
+    print("=" * 80)
+    print(f"CLASSIFICATION REPORT FOR {variant}")
+    print("=" * 80)
+    print(report)
 
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
+    result_path = Path(output_dir) / "test_results.json"
+
+    with result_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "variant": variant,
+                "metrics": metrics,
+                "classification_report": report,
+                "labels": label_list,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print(f"Saved results to {result_path}")
+
     return metrics
+
+
+# -------------------------
+# Main
+# -------------------------
 
 
 def main():
@@ -565,8 +784,18 @@ def main():
     print("=" * 80)
     print("ALL RESULTS")
     print("=" * 80)
+
     for variant, metrics in all_metrics.items():
-        print(variant, metrics)
+        print(variant)
+        print(metrics)
+
+    output_root = Path(args.output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    with (output_root / "all_results.json").open("w", encoding="utf-8") as f:
+        json.dump(all_metrics, f, indent=2, ensure_ascii=False)
+
+    print(f"Saved all results to {output_root / 'all_results.json'}")
 
 
 if __name__ == "__main__":
