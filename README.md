@@ -102,3 +102,10 @@ The results are saved to: `outputs/ner_hipe/all_results.json`.
 | `baseline` | **0.7879** | **0.7422** | **0.7644** | 0.1448 | 0.86 | **0.60** | **0.69** | **0.71** | **0.37** | **0.65** | **0.76** | 5 |
 | `stacked` | 0.7675 | 0.7288 | 0.7476 | **0.1307** | **0.87** | 0.57 | 0.65 | 0.65 | 0.24 | 0.60 | 0.74 | 5 |
 | `time` | 0.7657 | 0.7173 | 0.7407 | 0.1445 | 0.85 | 0.57 | 0.66 | 0.57 | 0.31 | 0.59 | 0.73 | 5 |
+
+
+| Model | HF repo | Overall P | Overall R | Overall F1 | Loss ↓ | loc F1 | org F1 | pers F1 | prod F1 | time F1 | Macro F1 | Weighted F1 | Epochs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `baseline` | [`historical-ner-baseline`](https://huggingface.co/EmanuelaBoros/historical-ner-baseline) | **0.7797** | **0.7543** | **0.7668** | 0.1132 | **0.87** | **0.61** | **0.68** | **0.66** | **0.40** | **0.65** | **0.76** | 5 |
+| `stacked` | [`historical-ner-stacked`](https://huggingface.co/EmanuelaBoros/historical-ner-stacked) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 5 |
+| `time` | [`historical-ner-time`](https://huggingface.co/EmanuelaBoros/historical-ner-time) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 5 |
